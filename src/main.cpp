@@ -13,7 +13,37 @@
 // ===== Configuration CAN =====
 #define CAN_SPEED    CAN_500KBPS
 #define CAN_CLOCK    MCP_8MHZ
-#define TX_CAN_ID    0x123
+
+// ===== Trames OBD-II / Automobile =====
+struct CarFrame {
+    unsigned long id;
+    uint8_t len;
+    uint8_t data[8];
+    const char* name;
+};
+
+// Trames OBD-II standards (ID 0x7DF = broadcast, réponses sur 0x7E8-0x7EF)
+const CarFrame carFrames[] = {
+    // Requêtes OBD-II Mode 01 (données en temps réel)
+    {0x7DF, 8, {0x02, 0x01, 0x0C, 0x55, 0x55, 0x55, 0x55, 0x55}, "RPM"},           // Régime moteur
+    {0x7DF, 8, {0x02, 0x01, 0x0D, 0x55, 0x55, 0x55, 0x55, 0x55}, "Vitesse"},       // Vitesse véhicule
+    {0x7DF, 8, {0x02, 0x01, 0x05, 0x55, 0x55, 0x55, 0x55, 0x55}, "Temp Eau"},      // Température liquide refroid.
+    {0x7DF, 8, {0x02, 0x01, 0x0F, 0x55, 0x55, 0x55, 0x55, 0x55}, "Temp Air"},      // Température air admission
+    {0x7DF, 8, {0x02, 0x01, 0x11, 0x55, 0x55, 0x55, 0x55, 0x55}, "Papillon"},      // Position papillon
+    {0x7DF, 8, {0x02, 0x01, 0x2F, 0x55, 0x55, 0x55, 0x55, 0x55}, "Carburant"},     // Niveau carburant
+    {0x7DF, 8, {0x02, 0x01, 0x04, 0x55, 0x55, 0x55, 0x55, 0x55}, "Charge Mot"},    // Charge moteur
+    {0x7DF, 8, {0x02, 0x01, 0x42, 0x55, 0x55, 0x55, 0x55, 0x55}, "Tension"},       // Tension batterie
+    
+    // Requête Mode 09 (infos véhicule)
+    {0x7DF, 8, {0x02, 0x09, 0x02, 0x55, 0x55, 0x55, 0x55, 0x55}, "VIN"},           // Numéro VIN
+    
+    // Trames CAN courantes (non-OBD)
+    {0x316, 8, {0x05, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "Regime BMW"},    // Régime BMW E46
+    {0x153, 8, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "Vitesse VAG"},   // Vitesse VAG
+    {0x280, 8, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "Regime PSA"},    // Régime PSA
+};
+const int numCarFrames = sizeof(carFrames) / sizeof(carFrames[0]);
+int currentFrameIndex = 0;
 
 // ===== Variables globales =====
 MCP_CAN CAN(CAN_CS_PIN);
@@ -23,14 +53,9 @@ unsigned long txCount = 0;
 unsigned long rxCount = 0;
 unsigned long lastTxTime = 0;
 unsigned long lastDisplayUpdate = 0;
-unsigned long lastBatteryUpdate = 0;
 bool debugSerial = true;
-bool displayInitialized = false;
-int lastBatteryPercent = -1;
-bool lastChargingState = false;
-unsigned long lastTxCount = 0;
-unsigned long lastRxCount = 0;
-int lastRxLogIndex = -1;
+bool sendingEnabled = false;  // En pause au démarrage
+bool lastSendingState = true; // Pour détecter changement
 
 // Buffer pour les messages reçus (log des 5 derniers)
 struct CanMessage {
@@ -81,6 +106,15 @@ int getBatteryPercent() {
     return percent;
 }
 
+// ===== Variables pour éviter le clignotement =====
+bool displayInitialized = false;
+int lastBatPercent = -1;
+bool lastCharging = false;
+unsigned long lastTxCount = 0;
+unsigned long lastRxCount = 0;
+unsigned long lastRxLogIndex = 0;
+bool lastDebugState = true;
+
 // ===== Fonctions d'affichage =====
 
 void drawRoundRect(int x, int y, int w, int h, int r, uint16_t borderColor, uint16_t fillColor) {
@@ -89,8 +123,10 @@ void drawRoundRect(int x, int y, int w, int h, int r, uint16_t borderColor, uint
 }
 
 void drawBatteryIcon(int x, int y, int percent, bool charging) {
-    // Icône batterie 24x12
     uint16_t color = (percent > 50) ? COLOR_OK : (percent > 20) ? COLOR_CHARGING : COLOR_ERROR;
+    
+    // Effacer zone batterie
+    M5.Lcd.fillRect(x, y, 28, 12, COLOR_HEADER);
     
     // Corps de la batterie
     M5.Lcd.drawRect(x, y, 22, 12, COLOR_TEXT);
@@ -98,250 +134,265 @@ void drawBatteryIcon(int x, int y, int percent, bool charging) {
     
     // Niveau de charge
     int barWidth = (percent * 18) / 100;
-    M5.Lcd.fillRect(x + 2, y + 2, barWidth, 8, color);
+    if (barWidth > 0) {
+        M5.Lcd.fillRect(x + 2, y + 2, barWidth, 8, color);
+    }
     
     // Éclair si en charge
     if (charging) {
-        M5.Lcd.setTextColor(COLOR_CHARGING);
+        M5.Lcd.setTextColor(COLOR_BG);
         M5.Lcd.setTextSize(1);
-        M5.Lcd.setCursor(x + 7, y + 2);
-        M5.Lcd.print("~");
+        M5.Lcd.setCursor(x + 6, y + 2);
+        M5.Lcd.print("+");
     }
 }
 
-void drawHeader(bool canOk, bool forceRedraw = false) {
-    static bool lastCanOk = false;
+void drawStaticElements() {
+    // Header fond
+    M5.Lcd.fillRect(0, 0, 320, 36, COLOR_HEADER);
+    M5.Lcd.drawFastHLine(0, 36, 320, COLOR_BORDER);
     
-    // Redessiner le header seulement si nécessaire
-    if (forceRedraw || !displayInitialized || canOk != lastCanOk) {
-        M5.Lcd.fillRect(0, 0, 320, 36, COLOR_HEADER);
-        M5.Lcd.drawFastHLine(0, 36, 320, COLOR_BORDER);
-        
-        // Statut CAN avec indicateur LED
-        int ledColor = canOk ? COLOR_OK : COLOR_ERROR;
-        M5.Lcd.fillCircle(18, 18, 8, ledColor);
-        M5.Lcd.drawCircle(18, 18, 8, COLOR_TEXT);
-        
-        M5.Lcd.setTextColor(COLOR_TEXT);
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setCursor(32, 10);
-        M5.Lcd.print("CAN");
-        
-        lastCanOk = canOk;
-    }
+    // Label CAN
+    M5.Lcd.setTextColor(COLOR_TEXT);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setCursor(32, 10);
+    M5.Lcd.print("CAN");
     
-    // Mettre à jour la batterie seulement si elle a changé
+    // Cadre TX
+    drawRoundRect(5, 42, 310, 50, 4, COLOR_TX, COLOR_BG);
+    M5.Lcd.fillRoundRect(10, 38, 30, 14, 3, COLOR_TX);
+    M5.Lcd.setTextColor(COLOR_BG);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(15, 41);
+    M5.Lcd.print("TX");
+    
+    // Cadre RX
+    drawRoundRect(5, 98, 310, 100, 4, COLOR_RX, COLOR_BG);
+    M5.Lcd.fillRoundRect(10, 94, 30, 14, 3, COLOR_RX);
+    M5.Lcd.setTextColor(COLOR_BG);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(15, 97);
+    M5.Lcd.print("RX");
+}
+
+void updateHeader(bool canOk) {
+    // LED CAN
+    int ledColor = canOk ? COLOR_OK : COLOR_ERROR;
+    M5.Lcd.fillCircle(18, 18, 8, ledColor);
+    M5.Lcd.drawCircle(18, 18, 8, COLOR_TEXT);
+    
+    // Batterie (seulement si changement)
     int batPercent = getBatteryPercent();
     bool isCharging = M5.Axp.isCharging();
     
-    if (forceRedraw || !displayInitialized || 
-        batPercent != lastBatteryPercent || isCharging != lastChargingState) {
-        // Effacer l'ancienne zone batterie
-        M5.Lcd.fillRect(220, 0, 100, 36, COLOR_HEADER);
+    if (batPercent != lastBatPercent || isCharging != lastCharging) {
+        lastBatPercent = batPercent;
+        lastCharging = isCharging;
         
-        drawBatteryIcon(220, 12, batPercent, isCharging);
+        drawBatteryIcon(218, 12, batPercent, isCharging);
         
+        // Pourcentage
+        M5.Lcd.fillRect(248, 8, 60, 20, COLOR_HEADER);
         M5.Lcd.setTextColor(COLOR_TEXT);
         M5.Lcd.setTextSize(2);
         M5.Lcd.setCursor(250, 10);
         M5.Lcd.printf("%d%%", batPercent);
-        
-        lastBatteryPercent = batPercent;
-        lastChargingState = isCharging;
     }
 }
 
-void drawTxSection(bool forceRedraw = false) {
-    static unsigned long lastDisplayedTxId = 0;
-    static unsigned long lastDisplayedTxCount = 0;
+void updateTxSection() {
+    static int lastFrameIndex = -1;
+    bool needUpdate = (txCount != lastTxCount) || (currentFrameIndex != lastFrameIndex);
     
-    // Redessiner le cadre seulement si nécessaire
-    if (forceRedraw || !displayInitialized) {
-        drawRoundRect(5, 42, 310, 50, 4, COLOR_TX, COLOR_BG);
+    if (needUpdate) {
+        lastTxCount = txCount;
+        lastFrameIndex = currentFrameIndex;
         
-        // Label TX
-        M5.Lcd.fillRoundRect(10, 38, 30, 14, 3, COLOR_TX);
-        M5.Lcd.setTextColor(COLOR_BG);
+        const CarFrame& frame = carFrames[currentFrameIndex];
+        
+        // Effacer zone données
+        M5.Lcd.fillRect(15, 50, 295, 40, COLOR_BG);
+        
+        // Nom de la trame + état
+        M5.Lcd.setTextColor(sendingEnabled ? COLOR_OK : COLOR_DIM);
         M5.Lcd.setTextSize(1);
-        M5.Lcd.setCursor(15, 41);
-        M5.Lcd.print("TX");
-    }
-    
-    // Mettre à jour ID et données seulement si changés
-    if (forceRedraw || !displayInitialized || lastTx.id != lastDisplayedTxId) {
-        // Effacer l'ancien ID
-        M5.Lcd.fillRect(15, 52, 80, 20, COLOR_BG);
+        M5.Lcd.setCursor(45, 41);
+        M5.Lcd.printf("%s %d/%d", sendingEnabled ? ">" : "||", currentFrameIndex + 1, numCarFrames);
         
-        M5.Lcd.setTextColor(COLOR_TX);
+        // Nom de la trame
+        M5.Lcd.setTextColor(COLOR_TEXT);
         M5.Lcd.setTextSize(2);
         M5.Lcd.setCursor(15, 52);
-        M5.Lcd.printf("0x%03lX", lastTx.id);
+        M5.Lcd.print(frame.name);
         
-        // Effacer les anciennes données
-        M5.Lcd.fillRect(15, 75, 200, 12, COLOR_BG);
+        // ID
+        M5.Lcd.setTextColor(COLOR_TX);
+        M5.Lcd.setCursor(150, 52);
+        M5.Lcd.printf("0x%03lX", frame.id);
         
+        // Données
         M5.Lcd.setTextColor(COLOR_TEXT);
         M5.Lcd.setTextSize(1);
         M5.Lcd.setCursor(15, 75);
-        M5.Lcd.print(formatHex(lastTx.data, lastTx.len));
+        M5.Lcd.print(formatHex((uint8_t*)frame.data, frame.len));
         
-        lastDisplayedTxId = lastTx.id;
-    }
-    
-    // Mettre à jour le compteur seulement s'il a changé
-    if (forceRedraw || !displayInitialized || txCount != lastDisplayedTxCount) {
-        M5.Lcd.fillRect(260, 52, 50, 20, COLOR_BG);
+        // Compteur TX
         M5.Lcd.setTextColor(COLOR_DIM);
-        M5.Lcd.setCursor(260, 52);
         M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(260, 52);
         M5.Lcd.printf("#%lu", txCount);
-        lastDisplayedTxCount = txCount;
     }
 }
 
-void drawRxLog(bool forceRedraw = false) {
-    static unsigned long lastDisplayedRxCount = 0;
-    static int lastRxLogIndex = -1;
+void updateRxLog() {
+    // Seulement si changement
+    if (rxCount == lastRxCount) return;
+    lastRxCount = rxCount;
     
-    // Redessiner le cadre seulement si nécessaire
-    if (forceRedraw || !displayInitialized) {
-        drawRoundRect(5, 98, 310, 100, 4, COLOR_RX, COLOR_BG);
-        
-        // Label RX
-        M5.Lcd.fillRoundRect(10, 94, 30, 14, 3, COLOR_RX);
-        M5.Lcd.setTextColor(COLOR_BG);
-        M5.Lcd.setTextSize(1);
-        M5.Lcd.setCursor(15, 97);
-        M5.Lcd.print("RX");
-    }
+    // Effacer zone log
+    M5.Lcd.fillRect(10, 105, 300, 88, COLOR_BG);
     
-    // Mettre à jour le compteur RX seulement s'il a changé
-    if (forceRedraw || !displayInitialized || rxCount != lastDisplayedRxCount) {
-        M5.Lcd.fillRect(270, 97, 40, 10, COLOR_BG);
-        M5.Lcd.setTextColor(COLOR_DIM);
-        M5.Lcd.setTextSize(1);
-        M5.Lcd.setCursor(270, 97);
-        M5.Lcd.printf("#%lu", rxCount);
-        lastDisplayedRxCount = rxCount;
-    }
+    // Compteur RX
+    M5.Lcd.setTextColor(COLOR_DIM);
+    M5.Lcd.setTextSize(1);
+    M5.Lcd.setCursor(270, 97);
+    M5.Lcd.fillRect(265, 94, 45, 12, COLOR_RX);
+    M5.Lcd.setTextColor(COLOR_BG);
+    M5.Lcd.printf("#%lu", rxCount);
     
-    // Redessiner la liste seulement si un nouveau message est arrivé
-    if (forceRedraw || !displayInitialized || rxLogIndex != lastRxLogIndex) {
-        // Effacer toute la zone de log
-        M5.Lcd.fillRect(10, 108, 300, 88, COLOR_BG);
-        
-        M5.Lcd.setTextSize(1);
-        int yPos = 108;
-        int msgDisplayed = 0;
-        
-        for (int i = 0; i < 5 && msgDisplayed < 4; i++) {
-            int idx = (rxLogIndex - 1 - i + 5) % 5;
-            if (rxLog[idx].len > 0) {
-                // Alternance de couleur de fond
-                if (msgDisplayed % 2 == 0) {
-                    M5.Lcd.fillRect(10, yPos, 300, 20, 0x1082);
-                }
-                
-                // ID en couleur
-                M5.Lcd.setTextColor(COLOR_RX);
-                M5.Lcd.setCursor(15, yPos + 6);
-                M5.Lcd.printf("0x%03lX", rxLog[idx].id);
-                
-                // Données
-                M5.Lcd.setTextColor(COLOR_TEXT);
-                M5.Lcd.setCursor(70, yPos + 6);
-                M5.Lcd.print(formatHex(rxLog[idx].data, rxLog[idx].len));
-                
-                yPos += 22;
-                msgDisplayed++;
+    // Liste des messages
+    int yPos = 108;
+    int msgDisplayed = 0;
+    
+    for (int i = 0; i < 5 && msgDisplayed < 4; i++) {
+        int idx = (rxLogIndex - 1 - i + 5) % 5;
+        if (rxLog[idx].len > 0) {
+            if (msgDisplayed % 2 == 0) {
+                M5.Lcd.fillRect(10, yPos, 300, 20, 0x1082);
             }
+            
+            M5.Lcd.setTextColor(COLOR_RX);
+            M5.Lcd.setCursor(15, yPos + 6);
+            M5.Lcd.printf("0x%03lX", rxLog[idx].id);
+            
+            M5.Lcd.setTextColor(COLOR_TEXT);
+            M5.Lcd.setCursor(70, yPos + 6);
+            M5.Lcd.print(formatHex(rxLog[idx].data, rxLog[idx].len));
+            
+            yPos += 22;
+            msgDisplayed++;
         }
-        
-        // Message si vide
-        if (msgDisplayed == 0) {
-            M5.Lcd.setTextColor(COLOR_DIM);
-            M5.Lcd.setTextSize(1);
-            M5.Lcd.setCursor(100, 140);
-            M5.Lcd.print("En attente de trames...");
-        }
-        
-        lastRxLogIndex = rxLogIndex;
+    }
+    
+    if (msgDisplayed == 0) {
+        M5.Lcd.setTextColor(COLOR_DIM);
+        M5.Lcd.setCursor(100, 140);
+        M5.Lcd.print("En attente de trames...");
     }
 }
 
-void drawButtons(bool forceRedraw = false) {
-    static bool lastDebugState = false;
+void updateButtons() {
+    static bool buttonsDrawn = false;
+    bool sendChanged = (sendingEnabled != lastSendingState);
+    bool debugChanged = (debugSerial != lastDebugState);
     
     int btnY = 205;
     int btnH = 30;
     int btnW = 100;
     int spacing = 5;
     
-    // Redessiner les boutons seulement si nécessaire
-    if (forceRedraw || !displayInitialized || debugSerial != lastDebugState) {
-        // Bouton SEND
-        drawRoundRect(spacing, btnY, btnW, btnH, 5, COLOR_TX, 0x0A4A);
-        M5.Lcd.setTextColor(COLOR_TX);
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setCursor(25, btnY + 8);
-        M5.Lcd.print("SEND");
+    // Première fois ou changement d'état PLAY/PAUSE
+    if (!buttonsDrawn || sendChanged) {
+        lastSendingState = sendingEnabled;
         
-        // Bouton CLEAR
+        // Bouton PLAY/PAUSE
+        uint16_t playColor = sendingEnabled ? COLOR_OK : COLOR_ERROR;
+        drawRoundRect(spacing, btnY, btnW, btnH, 5, playColor, sendingEnabled ? 0x0320 : 0x4000);
+        M5.Lcd.setTextColor(playColor);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(spacing + 15, btnY + 8);
+        M5.Lcd.print(sendingEnabled ? "PAUSE" : " PLAY");
+    }
+    
+    // Bouton NEXT (statique après premier dessin)
+    if (!buttonsDrawn) {
         drawRoundRect(btnW + spacing * 2, btnY, btnW, btnH, 5, COLOR_CHARGING, 0x4200);
         M5.Lcd.setTextColor(COLOR_CHARGING);
-        M5.Lcd.setCursor(btnW + spacing * 2 + 15, btnY + 8);
-        M5.Lcd.print("CLEAR");
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(btnW + spacing * 2 + 20, btnY + 8);
+        M5.Lcd.print("NEXT");
+    }
+    
+    // Bouton DEBUG
+    if (!buttonsDrawn || debugChanged) {
+        lastDebugState = debugSerial;
         
-        // Bouton DEBUG (seulement si l'état a changé)
         uint16_t dbgColor = debugSerial ? COLOR_OK : COLOR_DIM;
         drawRoundRect(btnW * 2 + spacing * 3, btnY, btnW, btnH, 5, dbgColor, debugSerial ? 0x0320 : 0x2104);
         M5.Lcd.setTextColor(dbgColor);
+        M5.Lcd.setTextSize(2);
         M5.Lcd.setCursor(btnW * 2 + spacing * 3 + 12, btnY + 8);
         M5.Lcd.print("DEBUG");
-        
-        lastDebugState = debugSerial;
     }
+    
+    buttonsDrawn = true;
 }
 
-void updateDisplay(bool canOk, bool forceRedraw = false) {
-    if (forceRedraw || !displayInitialized) {
-        // Premier affichage : tout redessiner
-        M5.Lcd.fillRect(0, 37, 320, 163, COLOR_BG);
-        drawHeader(canOk, true);
-        drawTxSection(true);
-        drawRxLog(true);
-        drawButtons(true);
+void updateDisplay(bool canOk) {
+    // Première fois : dessiner tout
+    if (!displayInitialized) {
+        M5.Lcd.fillScreen(COLOR_BG);
+        drawStaticElements();
         displayInitialized = true;
-    } else {
-        // Mise à jour partielle : seulement ce qui change
-        drawHeader(canOk, false);
-        drawTxSection(false);
-        drawRxLog(false);
-        drawButtons(false);
+        // Forcer mise à jour de tout
+        lastBatPercent = -1;
+        lastTxCount = 0;
+        lastRxCount = 0;
+        lastDebugState = !debugSerial;
+        lastSendingState = !sendingEnabled;
     }
+    
+    // Mises à jour partielles seulement
+    updateHeader(canOk);
+    updateTxSection();
+    updateRxLog();
+    updateButtons();
 }
 
 // ===== Envoi CAN =====
 void sendCanMessage() {
-    // Données d'exemple (incrémentées à chaque envoi)
-    static uint8_t counter = 0;
-    uint8_t data[8] = {counter++, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, counter};
+    const CarFrame& frame = carFrames[currentFrameIndex];
     
-    byte result = CAN.sendMsgBuf(TX_CAN_ID, 0, 8, data);
+    byte result = CAN.sendMsgBuf(frame.id, 0, frame.len, (uint8_t*)frame.data);
     
     if (result == CAN_OK) {
         txCount++;
-        lastTx.id = TX_CAN_ID;
-        lastTx.len = 8;
-        memcpy(lastTx.data, data, 8);
+        lastTx.id = frame.id;
+        lastTx.len = frame.len;
+        memcpy(lastTx.data, frame.data, frame.len);
         
         if (debugSerial) {
-            Serial.printf("[TX] ID: 0x%03X Data: %s\n", TX_CAN_ID, formatHex(data, 8).c_str());
+            Serial.printf("[TX] %s ID: 0x%03lX Data: %s\n", 
+                frame.name, frame.id, formatHex((uint8_t*)frame.data, frame.len).c_str());
         }
     } else {
         if (debugSerial) {
             Serial.println("[TX] Erreur d'envoi CAN");
         }
+    }
+}
+
+void nextFrame() {
+    currentFrameIndex = (currentFrameIndex + 1) % numCarFrames;
+    if (debugSerial) {
+        Serial.printf("[FRAME] %d/%d: %s\n", currentFrameIndex + 1, numCarFrames, carFrames[currentFrameIndex].name);
+    }
+}
+
+void prevFrame() {
+    currentFrameIndex = (currentFrameIndex - 1 + numCarFrames) % numCarFrames;
+    if (debugSerial) {
+        Serial.printf("[FRAME] %d/%d: %s\n", currentFrameIndex + 1, numCarFrames, carFrames[currentFrameIndex].name);
     }
 }
 
@@ -467,17 +518,17 @@ void setup() {
     Serial.printf("Batterie: %d%% %s\n", getBatteryPercent(), 
                   M5.Axp.isCharging() ? "(en charge)" : "");
     
-    delay(1500);  // Laisser voir le message
+    delay(1000);  // Laisser voir le message
     
     // Initialiser les structures
     memset(&lastTx, 0, sizeof(lastTx));
-    lastTx.id = TX_CAN_ID;
+    lastTx.id = 1234;
     lastTx.len = 8;
     memset(rxLog, 0, sizeof(rxLog));
     
-    // Affichage initial
-    M5.Lcd.fillScreen(COLOR_BG);
-    updateDisplay(true, true);  // Force redraw pour l'init
+    // Affichage initial (displayInitialized = false donc tout sera dessiné)
+    displayInitialized = false;
+    updateDisplay(true);
 }
 
 // ===== Loop =====
@@ -491,30 +542,31 @@ void loop() {
         receiveCanMessages();
     }
     
-    // Envoi automatique toutes les secondes
-    if (now - lastTxTime >= 1000) {
+    // Envoi automatique toutes les secondes (seulement si activé)
+    if (sendingEnabled && (now - lastTxTime >= 1000)) {
         lastTxTime = now;
         sendCanMessage();
     }
     
-    // Bouton A : Envoyer manuellement
+    // Bouton A : Play/Pause envoi automatique
     if (M5.BtnA.wasPressed()) {
-        sendCanMessage();
-        if (debugSerial) Serial.println("[BTN] Envoi manuel");
+        sendingEnabled = !sendingEnabled;
+        if (debugSerial) {
+            Serial.printf("[BTN] Envoi auto: %s\n", sendingEnabled ? "PLAY" : "PAUSE");
+        }
+        if (sendingEnabled) {
+            lastTxTime = now;  // Reset timer pour envoi immédiat
+        }
     }
     
-    // Bouton B : Effacer le log
+    // Bouton B : Trame suivante
     if (M5.BtnB.wasPressed()) {
-        memset(rxLog, 0, sizeof(rxLog));
-        rxLogIndex = 0;
-        rxCount = 0;
-        txCount = 0;
-        lastRxLogIndex = -1;  // Forcer redraw du log
-        lastDisplayedRxCount = 0;
-        lastDisplayedTxCount = 0;
-        if (debugSerial) Serial.println("[BTN] Log efface");
-        drawRxLog(true);  // Redessiner immédiatement
-        drawTxSection(true);
+        nextFrame();
+        // Envoyer immédiatement la nouvelle trame si en mode play
+        if (sendingEnabled) {
+            sendCanMessage();
+            lastTxTime = now;
+        }
     }
     
     // Bouton C : Toggle debug série
@@ -523,17 +575,40 @@ void loop() {
         Serial.printf("[BTN] Debug serie: %s\n", debugSerial ? "ON" : "OFF");
     }
     
-    // Mise à jour de l'affichage toutes les 500ms (moins fréquent pour éviter le clignotement)
-    if (now - lastDisplayUpdate >= 500) {
-        lastDisplayUpdate = now;
-        updateDisplay(true, false);
+    // Appui long sur écran : trame précédente (zone gauche) ou reset compteurs (zone droite)
+    if (M5.Touch.ispressed()) {
+        auto t = M5.Touch.getPressPoint();
+        static unsigned long touchStart = 0;
+        static bool longPressHandled = false;
+        
+        if (touchStart == 0) {
+            touchStart = now;
+            longPressHandled = false;
+        } else if (!longPressHandled && (now - touchStart > 800)) {
+            // Appui long
+            if (t.x < 160) {
+                // Zone gauche : trame précédente
+                prevFrame();
+            } else {
+                // Zone droite : reset compteurs
+                txCount = 0;
+                rxCount = 0;
+                memset(rxLog, 0, sizeof(rxLog));
+                rxLogIndex = 0;
+                if (debugSerial) Serial.println("[TOUCH] Compteurs remis a zero");
+            }
+            longPressHandled = true;
+        }
+    } else {
+        // Reset quand relâché
+        static unsigned long touchStart = 0;
+        touchStart = 0;
     }
     
-    // Mise à jour batterie toutes les 2 secondes (change moins souvent)
-    if (now - lastBatteryUpdate >= 2000) {
-        lastBatteryUpdate = now;
-        // Forcer la mise à jour de la batterie
-        lastBatteryPercent = -1;
+    // Mise à jour de l'affichage toutes les 100ms (seules les zones modifiées sont redessinées)
+    if (now - lastDisplayUpdate >= 100) {
+        lastDisplayUpdate = now;
+        updateDisplay(true);
     }
     
     delay(10);
