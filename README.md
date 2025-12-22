@@ -16,6 +16,9 @@ A professional CAN bus monitor and transmitter for M5Stack Core2 with COMMU modu
 - ✅ **Battery Monitoring** - Real-time battery level and charging status
 - ✅ **Touch Controls** - Navigate frames with touch gestures
 - ✅ **Serial Debug** - Optional serial output for debugging
+- ✅ **Power Management** - Automatic screen dimming and fast charging support
+- ✅ **Battery Saving** - Screen auto-off after inactivity, optimized power consumption
+- ✅ **SD Card Logging** - Record all CAN frames (TX and RX) to SD card in CSV format
 
 ## Hardware Requirements
 
@@ -64,11 +67,31 @@ pio device monitor
 
 ### Controls
 
-- **Button A**: Play/Pause automatic frame transmission
+- **Button A**: Play/Pause automatic frame transmission (first press wakes screen if off)
 - **Button B**: Next frame (cycle through available frames)
-- **Button C**: Toggle serial debug output
-- **Long Press Left**: Previous frame
-- **Long Press Right**: Reset TX/RX counters
+- **Button C (short)**: Toggle serial debug output
+- **Button C (long 1s)**: Cycle brightness (100% → 30% → 10%)
+- **Button C (long 2s)**: Toggle SD card logging
+- **Long Press Left Screen**: Previous frame
+- **Long Press Right Screen**: Reset TX/RX counters
+- **Long Press Header**: Cycle brightness levels
+- **Long Press SD Icon**: Toggle SD card logging
+- **Double Tap Header**: Toggle screen on/off instantly
+
+### Power Management
+
+The device includes smart power management features:
+
+| Feature | Description |
+|---------|-------------|
+| **Fast Charging** | Up to 780mA charge current for faster battery charging |
+| **Auto Dim** | Screen dims to 30% after 15 seconds of inactivity |
+| **Auto Off** | Screen turns off after 60 seconds of inactivity |
+| **Manual Brightness** | Long press Button C or header to cycle brightness |
+| **Instant Wake** | Any button or touch immediately wakes the screen |
+| **Power Saving** | Unused peripherals (vibration motor) disabled |
+
+**Note**: CAN communication continues even when the screen is off!
 
 ### Available CAN Frames
 
@@ -90,10 +113,34 @@ The project includes pre-configured OBD-II and automotive frames:
 ### Display Interface
 
 The screen shows:
-- **Header**: CAN status LED, battery level with charging indicator
+- **Header**: CAN status LED, brightness indicator, SD card status, charging indicator, battery level
 - **TX Section**: Current frame being sent (name, ID, data)
 - **RX Log**: Last 4 received CAN messages
 - **Counters**: Total TX and RX frame counts
+
+### SD Card Logging
+
+All CAN frames (both TX and RX) can be logged to the SD card in CSV format:
+
+**File Format:**
+```
+=== M5Stack CAN Bus Logger ===
+Started: 12345 ms
+Format: timestamp_ms,type,id,length,data_hex
+---
+12345,TX,0x7DF,8,02 01 0C 55 55 55 55 55
+12350,RX,0x7E8,8,04 41 0C 1A F0 00 00 00
+```
+
+**Features:**
+- Automatic file rotation when file size exceeds 10MB
+- Files named `can_log_0.txt`, `can_log_1.txt`, etc.
+- Data flushed every 5 seconds to prevent data loss
+- Visual indicator in header (green = logging active, red dot = recording)
+
+**Requirements:**
+- SD card must be inserted before power-on
+- SD card will be initialized automatically on startup
 
 ## Configuration
 
@@ -116,6 +163,29 @@ const CarFrame carFrames[] = {
     {0x123, 8, {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x11}, "Custom"},
 };
 ```
+
+### Power Management Settings
+
+Adjust power saving timeouts in `src/main.cpp`:
+
+```cpp
+#define BRIGHTNESS_MAX       100    // Max brightness (%)
+#define BRIGHTNESS_DIM       30     // Dimmed brightness (%)
+#define BRIGHTNESS_MIN       10     // Minimum before off (%)
+#define TIMEOUT_DIM_MS       15000  // 15s before dimming
+#define TIMEOUT_OFF_MS       60000  // 60s before screen off
+#define CHARGE_CURRENT_FAST  0x0F   // 780mA charge (see values below)
+```
+
+**Charge Current Values (AXP192):**
+| Value | Current | Value | Current |
+|-------|---------|-------|---------|
+| 0x00  | 100mA   | 0x08  | 780mA   |
+| 0x02  | 280mA   | 0x0A  | 960mA   |
+| 0x04  | 450mA   | 0x0C  | 1080mA  |
+| 0x06  | 630mA   | 0x0F  | 1320mA  |
+
+⚠️ **Warning**: Higher charge currents generate more heat. 780mA is recommended for safe fast charging.
 
 ## Project Structure
 
@@ -153,6 +223,15 @@ m5can/
 - Reboot the device
 - Check if touchscreen is responding
 - Verify M5Core2 library version
+
+### SD Card Issues
+
+- Ensure SD card is inserted before power-on
+- Use SDHC cards (up to 32GB) for best compatibility
+- Format SD card as FAT32 if issues occur
+- Check that SD card is not write-protected
+- Verify SD card is properly seated in the slot
+- If logging fails, check serial output for error messages
 
 ## License
 

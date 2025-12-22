@@ -1,5 +1,8 @@
 #include <M5Core2.h>
 #include <SPI.h>
+#include <Wire.h>
+#include <FS.h>
+#include <SD.h>
 #include <mcp_can.h>
 
 // ===== CAN Pin Configuration (COMMU Module on Core2) =====
@@ -57,6 +60,30 @@ bool debugSerial = true;
 bool sendingEnabled = false;  // Paused at startup
 bool lastSendingState = true; // To detect state change
 
+// ===== Power Management & Screen Dimming =====
+#define BRIGHTNESS_MAX       100    // Maximum brightness (0-100 maps to LCD voltage)
+#define BRIGHTNESS_DIM       30     // Dimmed brightness
+#define BRIGHTNESS_MIN       10     // Minimum before off
+#define TIMEOUT_DIM_MS       15000  // 15s before dimming
+#define TIMEOUT_OFF_MS       60000  // 60s before screen off
+#define CHARGE_CURRENT_FAST  0x0F   // ~780mA charge current (max safe)
+
+uint8_t currentBrightness = BRIGHTNESS_MAX;
+uint8_t targetBrightness = BRIGHTNESS_MAX;
+bool screenOn = true;
+unsigned long lastActivityTime = 0;
+bool powerSaveMode = false;
+bool displayInitialized = false;  // Declared early for power management functions
+
+// ===== SD Card Logging =====
+bool sdInitialized = false;
+bool sdLoggingEnabled = false;
+File logFile;
+unsigned long logFileSize = 0;
+#define MAX_LOG_FILE_SIZE  10485760  // 10MB max file size
+#define LOG_FILENAME_PREFIX "/can_log_"
+#define LOG_FILENAME_EXT   ".txt"
+
 // Buffer for received messages (log of last 5)
 struct CanMessage {
     unsigned long id;
@@ -106,8 +133,292 @@ int getBatteryPercent() {
     return percent;
 }
 
+// ===== Power Management Functions =====
+
+// Set LCD brightness (0-100%)
+void setScreenBrightness(uint8_t percent) {
+    if (percent > 100) percent = 100;
+    currentBrightness = percent;
+    
+    if (percent == 0) {
+        // Turn off LCD backlight completely
+        M5.Axp.SetDCDC3(false);  // LCD power off
+        screenOn = false;
+    } else {
+        if (!screenOn) {
+            M5.Axp.SetDCDC3(true);  // LCD power on
+            screenOn = true;
+        }
+        // Map 1-100% to LCD voltage range (2500-3300mV)
+        // Lower voltage = dimmer, but too low can cause issues
+        // Using brightness via PWM is better - M5Core2 uses 2800mV typical
+        uint16_t voltage = 2500 + (percent * 5);  // 2505-3000mV range
+        if (voltage > 3000) voltage = 3000;
+        M5.Axp.SetLcdVoltage(voltage);
+    }
+    
+    if (debugSerial) {
+        Serial.printf("[PWR] Brightness: %d%%\n", percent);
+    }
+}
+
+// Wake up screen and reset activity timer
+void wakeScreen() {
+    lastActivityTime = millis();
+    
+    if (!screenOn || currentBrightness < targetBrightness) {
+        setScreenBrightness(targetBrightness);
+        powerSaveMode = false;
+        displayInitialized = false;  // Force redraw after wake
+        if (debugSerial) {
+            Serial.println("[PWR] Screen wake up");
+        }
+    }
+}
+
+// Configure fast charging
+void setupFastCharging() {
+    // AXP192 charge current settings:
+    // 0x00 = 100mA, 0x01 = 190mA, 0x02 = 280mA, 0x03 = 360mA
+    // 0x04 = 450mA, 0x05 = 550mA, 0x06 = 630mA, 0x07 = 700mA
+    // 0x08 = 780mA, 0x09 = 880mA, 0x0A = 960mA, 0x0B = 1000mA
+    // 0x0C = 1080mA, 0x0D = 1160mA, 0x0E = 1240mA, 0x0F = 1320mA (MAX)
+    
+    // Use 780mA for safe fast charging (higher can heat battery)
+    // Access AXP192 register directly via I2C
+    // Register 0x33: bit 7 = charge enable, bits 3-0 = current (0x08 = 780mA)
+    Wire.beginTransmission(0x34);  // AXP192 I2C address
+    Wire.write(0x33);  // Register address
+    Wire.write(0xC8);  // 0xC8 = enable (bit 7) + 780mA (0x08)
+    Wire.endTransmission();
+    
+    if (debugSerial) {
+        Serial.println("[PWR] Fast charging enabled (780mA)");
+    }
+}
+
+// Reduce power consumption
+void setupPowerSaving() {
+    // Disable unused peripherals to save power
+    M5.Axp.SetLDO2(true);   // Keep LCD backlight enabled
+    
+    // Note: LDO3 (vibration motor) control may not be available in M5Core2 API
+    // The vibration motor is typically controlled via GPIO, not AXP LDO
+    
+    // Set CPU frequency lower when idle (optional - can affect CAN timing)
+    // setCpuFrequencyMhz(80);  // Reduce from 240MHz to 80MHz
+    
+    if (debugSerial) {
+        Serial.println("[PWR] Power saving configured");
+    }
+}
+
+// Check and update power saving state
+void updatePowerSaving() {
+    unsigned long now = millis();
+    unsigned long idleTime = now - lastActivityTime;
+    
+    if (screenOn) {
+        if (idleTime > TIMEOUT_OFF_MS && !powerSaveMode) {
+            // Screen OFF after long inactivity
+            setScreenBrightness(0);
+            powerSaveMode = true;
+            if (debugSerial) {
+                Serial.println("[PWR] Screen OFF (timeout)");
+            }
+        } else if (idleTime > TIMEOUT_DIM_MS && currentBrightness > BRIGHTNESS_DIM) {
+            // Dim screen after short inactivity
+            setScreenBrightness(BRIGHTNESS_DIM);
+            if (debugSerial) {
+                Serial.println("[PWR] Screen dimmed");
+            }
+        }
+    }
+}
+
+// Cycle through brightness levels manually
+void cycleBrightness() {
+    lastActivityTime = millis();
+    
+    if (targetBrightness == BRIGHTNESS_MAX) {
+        targetBrightness = BRIGHTNESS_DIM;
+    } else if (targetBrightness == BRIGHTNESS_DIM) {
+        targetBrightness = BRIGHTNESS_MIN;
+    } else {
+        targetBrightness = BRIGHTNESS_MAX;
+    }
+    
+    setScreenBrightness(targetBrightness);
+    
+    if (debugSerial) {
+        Serial.printf("[PWR] Brightness set to %d%%\n", targetBrightness);
+    }
+}
+
+// ===== SD Card Functions =====
+
+// Initialize SD card
+bool initSD() {
+    if (sdInitialized) return true;
+    
+    if (!SD.begin()) {
+        if (debugSerial) {
+            Serial.println("[SD] Failed to initialize SD card");
+        }
+        return false;
+    }
+    
+    uint8_t cardType = SD.cardType();
+    if (cardType == CARD_NONE) {
+        if (debugSerial) {
+            Serial.println("[SD] No SD card found");
+        }
+        return false;
+    }
+    
+    sdInitialized = true;
+    
+    if (debugSerial) {
+        Serial.print("[SD] Card type: ");
+        switch (cardType) {
+            case CARD_MMC: Serial.println("MMC"); break;
+            case CARD_SD: Serial.println("SDSC"); break;
+            case CARD_SDHC: Serial.println("SDHC"); break;
+            default: Serial.println("Unknown"); break;
+        }
+        Serial.printf("[SD] Card size: %.2f GB\n", (float)SD.cardSize() / (1024 * 1024 * 1024));
+    }
+    
+    return true;
+}
+
+// Create a new log file with timestamp
+String createLogFilename() {
+    // Find next available filename
+    int fileNum = 0;
+    String filename;
+    
+    do {
+        filename = String(LOG_FILENAME_PREFIX) + String(fileNum) + String(LOG_FILENAME_EXT);
+        fileNum++;
+    } while (SD.exists(filename) && fileNum < 1000);
+    
+    return filename;
+}
+
+// Open log file for writing
+bool openLogFile() {
+    if (!sdInitialized) {
+        if (!initSD()) {
+            return false;
+        }
+    }
+    
+    // Close existing file if open
+    if (logFile) {
+        logFile.close();
+    }
+    
+    String filename = createLogFilename();
+    logFile = SD.open(filename, FILE_WRITE);
+    
+    if (!logFile) {
+        if (debugSerial) {
+            Serial.printf("[SD] Failed to open file: %s\n", filename.c_str());
+        }
+        return false;
+    }
+    
+    logFileSize = 0;
+    
+    // Write header
+    logFile.println("=== M5Stack CAN Bus Logger ===");
+    logFile.printf("Started: %lu ms\n", millis());
+    logFile.println("Format: timestamp_ms,type,id,length,data_hex");
+    logFile.println("---");
+    
+    if (debugSerial) {
+        Serial.printf("[SD] Logging to: %s\n", filename.c_str());
+    }
+    
+    return true;
+}
+
+// Close log file
+void closeLogFile() {
+    if (logFile) {
+        logFile.close();
+        if (debugSerial) {
+            Serial.println("[SD] Log file closed");
+        }
+    }
+}
+
+// Log a CAN frame to SD card
+void logCanFrame(const char* type, unsigned long id, uint8_t len, uint8_t* data) {
+    if (!sdLoggingEnabled || !logFile) {
+        return;
+    }
+    
+    // Check file size limit
+    if (logFileSize > MAX_LOG_FILE_SIZE) {
+        closeLogFile();
+        if (!openLogFile()) {
+            sdLoggingEnabled = false;
+            if (debugSerial) {
+                Serial.println("[SD] Failed to create new log file, logging disabled");
+            }
+            return;
+        }
+    }
+    
+    // Format: timestamp_ms,type,id,length,data_hex
+    unsigned long timestamp = millis();
+    logFile.printf("%lu,%s,0x%03lX,%d,", timestamp, type, id, len);
+    
+    // Write data as hex
+    for (int i = 0; i < len; i++) {
+        if (data[i] < 0x10) logFile.print("0");
+        logFile.print(data[i], HEX);
+        if (i < len - 1) logFile.print(" ");
+    }
+    logFile.println();
+    
+    logFileSize = logFile.size();
+    
+    // Flush periodically to prevent data loss
+    static unsigned long lastFlush = 0;
+    if (millis() - lastFlush > 5000) {  // Every 5 seconds
+        logFile.flush();
+        lastFlush = millis();
+    }
+}
+
+// Toggle SD logging
+void toggleSDLogging() {
+    if (!sdLoggingEnabled) {
+        // Enable logging
+        if (openLogFile()) {
+            sdLoggingEnabled = true;
+            if (debugSerial) {
+                Serial.println("[SD] Logging enabled");
+            }
+        } else {
+            if (debugSerial) {
+                Serial.println("[SD] Failed to enable logging");
+            }
+        }
+    } else {
+        // Disable logging
+        closeLogFile();
+        sdLoggingEnabled = false;
+        if (debugSerial) {
+            Serial.println("[SD] Logging disabled");
+        }
+    }
+}
+
 // ===== Variables to prevent flickering =====
-bool displayInitialized = false;
 int lastBatPercent = -1;
 bool lastCharging = false;
 unsigned long lastTxCount = 0;
@@ -175,15 +486,88 @@ void drawStaticElements() {
     M5.Lcd.print("RX");
 }
 
+void drawBrightnessIcon(int x, int y, uint8_t brightness) {
+    // Sun icon with rays based on brightness
+    uint16_t color = (brightness >= BRIGHTNESS_MAX) ? COLOR_CHARGING : 
+                     (brightness >= BRIGHTNESS_DIM) ? COLOR_DIM : COLOR_ERROR;
+    
+    // Clear area
+    M5.Lcd.fillRect(x, y, 20, 12, COLOR_HEADER);
+    
+    // Sun circle
+    M5.Lcd.fillCircle(x + 6, y + 6, 3, color);
+    
+    // Rays (more rays = brighter)
+    if (brightness >= BRIGHTNESS_DIM) {
+        M5.Lcd.drawLine(x + 6, y, x + 6, y + 2, color);      // Top
+        M5.Lcd.drawLine(x + 6, y + 10, x + 6, y + 12, color); // Bottom
+        M5.Lcd.drawLine(x, y + 6, x + 2, y + 6, color);      // Left
+        M5.Lcd.drawLine(x + 10, y + 6, x + 12, y + 6, color); // Right
+    }
+    if (brightness >= BRIGHTNESS_MAX) {
+        M5.Lcd.drawLine(x + 2, y + 2, x + 4, y + 4, color);   // TL
+        M5.Lcd.drawLine(x + 8, y + 4, x + 10, y + 2, color);  // TR
+        M5.Lcd.drawLine(x + 2, y + 10, x + 4, y + 8, color);  // BL
+        M5.Lcd.drawLine(x + 8, y + 8, x + 10, y + 10, color); // BR
+    }
+}
+
+void drawSDIcon(int x, int y, bool enabled, bool initialized) {
+    // SD card icon
+    uint16_t color = initialized ? (enabled ? COLOR_OK : COLOR_DIM) : COLOR_ERROR;
+    
+    // Clear area
+    M5.Lcd.fillRect(x, y, 18, 12, COLOR_HEADER);
+    
+    // SD card shape
+    M5.Lcd.drawRect(x + 2, y + 1, 12, 10, color);
+    M5.Lcd.fillRect(x + 3, y + 2, 2, 2, color);
+    
+    // Recording indicator (red dot when recording)
+    if (enabled && initialized) {
+        M5.Lcd.fillCircle(x + 14, y + 6, 2, COLOR_ERROR);
+    }
+}
+
 void updateHeader(bool canOk) {
     // CAN LED
     int ledColor = canOk ? COLOR_OK : COLOR_ERROR;
     M5.Lcd.fillCircle(18, 18, 8, ledColor);
     M5.Lcd.drawCircle(18, 18, 8, COLOR_TEXT);
     
+    // Brightness icon (after CAN label)
+    static uint8_t lastBrightness = 255;
+    if (currentBrightness != lastBrightness) {
+        lastBrightness = currentBrightness;
+        drawBrightnessIcon(70, 12, currentBrightness);
+    }
+    
+    // SD card icon
+    static bool lastSDState = false;
+    static bool lastSDInit = false;
+    if (sdLoggingEnabled != lastSDState || sdInitialized != lastSDInit) {
+        lastSDState = sdLoggingEnabled;
+        lastSDInit = sdInitialized;
+        drawSDIcon(110, 12, sdLoggingEnabled, sdInitialized);
+    }
+    
+    // Fast charge indicator
+    static bool lastFastCharge = false;
+    bool isCharging = M5.Axp.isCharging();
+    if (isCharging != lastFastCharge) {
+        lastFastCharge = isCharging;
+        M5.Lcd.fillRect(130, 10, 20, 16, COLOR_HEADER);
+        if (isCharging) {
+            // Lightning bolt for fast charging
+            M5.Lcd.setTextColor(COLOR_CHARGING);
+            M5.Lcd.setTextSize(2);
+            M5.Lcd.setCursor(130, 10);
+            M5.Lcd.print("^");
+        }
+    }
+    
     // Battery (only if changed)
     int batPercent = getBatteryPercent();
-    bool isCharging = M5.Axp.isCharging();
     
     if (batPercent != lastBatPercent || isCharging != lastCharging) {
         lastBatPercent = batPercent;
@@ -371,6 +755,9 @@ void sendCanMessage() {
         lastTx.len = frame.len;
         memcpy(lastTx.data, frame.data, frame.len);
         
+        // Log to SD card
+        logCanFrame("TX", frame.id, frame.len, (uint8_t*)frame.data);
+        
         if (debugSerial) {
             Serial.printf("[TX] %s ID: 0x%03lX Data: %s\n", 
                 frame.name, frame.id, formatHex((uint8_t*)frame.data, frame.len).c_str());
@@ -413,6 +800,9 @@ void receiveCanMessages() {
         
         rxCount++;
         
+        // Log to SD card
+        logCanFrame("RX", rxId, len, rxBuf);
+        
         if (debugSerial) {
             Serial.printf("[RX] ID: 0x%03lX Data: %s\n", rxId, formatHex(rxBuf, len).c_str());
         }
@@ -424,7 +814,7 @@ void receiveCanMessages() {
 void setup() {
     // Initialize M5Core2 (LCD, SD, Serial, I2C)
     // Note: Speaker (I2S) disabled because GPIO2 is shared with CAN_INT
-    M5.begin(true, false, true, true, kMBusModeOutput);
+    M5.begin(true, true, true, true, kMBusModeOutput);  // SD enabled
     
     M5.Lcd.fillScreen(COLOR_BG);
     M5.Lcd.setTextSize(2);
@@ -518,6 +908,25 @@ void setup() {
     Serial.printf("Battery: %d%% %s\n", getBatteryPercent(), 
                   M5.Axp.isCharging() ? "(charging)" : "");
     
+    // Configure power management
+    setupFastCharging();
+    setupPowerSaving();
+    setScreenBrightness(BRIGHTNESS_MAX);
+    lastActivityTime = millis();
+    
+    // Initialize SD card
+    M5.Lcd.setCursor(20, 175);
+    M5.Lcd.print("Init SD...");
+    if (initSD()) {
+        M5.Lcd.setTextColor(COLOR_OK);
+        M5.Lcd.println(" OK");
+        Serial.println("SD card initialized");
+    } else {
+        M5.Lcd.setTextColor(COLOR_ERROR);
+        M5.Lcd.println(" FAIL");
+        Serial.println("SD card initialization failed");
+    }
+    
     delay(1000);  // Let message be visible
     
     // Initialize structures
@@ -529,6 +938,9 @@ void setup() {
     // Initial display (displayInitialized = false so everything will be drawn)
     displayInitialized = false;
     updateDisplay(true);
+    
+    // Force SD icon update
+    drawSDIcon(110, 12, sdLoggingEnabled, sdInitialized);
 }
 
 // ===== Loop =====
@@ -550,63 +962,153 @@ void loop() {
     
     // Button A: Play/Pause automatic sending
     if (M5.BtnA.wasPressed()) {
-        sendingEnabled = !sendingEnabled;
-        if (debugSerial) {
-            Serial.printf("[BTN] Auto send: %s\n", sendingEnabled ? "PLAY" : "PAUSE");
-        }
-        if (sendingEnabled) {
-            lastTxTime = now;  // Reset timer for immediate send
+        wakeScreen();  // Wake screen on activity
+        
+        // If screen was off, first press just wakes up
+        if (powerSaveMode) {
+            powerSaveMode = false;
+        } else {
+            sendingEnabled = !sendingEnabled;
+            if (debugSerial) {
+                Serial.printf("[BTN] Auto send: %s\n", sendingEnabled ? "PLAY" : "PAUSE");
+            }
+            if (sendingEnabled) {
+                lastTxTime = now;  // Reset timer for immediate send
+            }
         }
     }
     
     // Button B: Next frame
     if (M5.BtnB.wasPressed()) {
-        nextFrame();
-        // Send new frame immediately if in play mode
-        if (sendingEnabled) {
-            sendCanMessage();
-            lastTxTime = now;
+        wakeScreen();  // Wake screen on activity
+        
+        if (!powerSaveMode) {
+            nextFrame();
+            // Send new frame immediately if in play mode
+            if (sendingEnabled) {
+                sendCanMessage();
+                lastTxTime = now;
+            }
         }
     }
     
-    // Button C: Toggle serial debug
-    if (M5.BtnC.wasPressed()) {
-        debugSerial = !debugSerial;
-        Serial.printf("[BTN] Serial debug: %s\n", debugSerial ? "ON" : "OFF");
+    // Button C: Toggle serial debug (short), cycle brightness (1s long), toggle SD logging (2s long)
+    static unsigned long btnCPressStart = 0;
+    static bool brightnessHandled = false;
+    static bool sdLoggingHandled = false;
+    
+    if (M5.BtnC.isPressed()) {
+        if (btnCPressStart == 0) {
+            btnCPressStart = now;
+            brightnessHandled = false;
+            sdLoggingHandled = false;
+        } else {
+            // Long press 1s: cycle brightness
+            if (!brightnessHandled && (now - btnCPressStart > 1000) && (now - btnCPressStart < 2000)) {
+                cycleBrightness();
+                brightnessHandled = true;
+            }
+            // Long press 2s: toggle SD logging
+            if (!sdLoggingHandled && (now - btnCPressStart > 2000)) {
+                toggleSDLogging();
+                sdLoggingHandled = true;
+            }
+        }
+    }
+    if (M5.BtnC.wasReleased()) {
+        wakeScreen();  // Wake screen on activity
+        
+        if (btnCPressStart > 0 && (now - btnCPressStart < 1000)) {
+            // Short press: toggle debug
+            if (!powerSaveMode) {
+                debugSerial = !debugSerial;
+                Serial.printf("[BTN] Serial debug: %s\n", debugSerial ? "ON" : "OFF");
+            }
+        }
+        btnCPressStart = 0;
+        brightnessHandled = false;
+        sdLoggingHandled = false;
     }
     
-    // Long press on screen: previous frame (left zone) or reset counters (right zone)
+    // Touch handling
+    static unsigned long touchStart = 0;
+    static bool longPressHandled = false;
+    static bool doubleTapPending = false;
+    static unsigned long lastTapTime = 0;
+    
     if (M5.Touch.ispressed()) {
         auto t = M5.Touch.getPressPoint();
-        static unsigned long touchStart = 0;
-        static bool longPressHandled = false;
         
-        if (touchStart == 0) {
-            touchStart = now;
-            longPressHandled = false;
-        } else if (!longPressHandled && (now - touchStart > 800)) {
-            // Long press
-            if (t.x < 160) {
-                // Left zone: previous frame
-                prevFrame();
-            } else {
-                // Right zone: reset counters
-                txCount = 0;
-                rxCount = 0;
-                memset(rxLog, 0, sizeof(rxLog));
-                rxLogIndex = 0;
-                if (debugSerial) Serial.println("[TOUCH] Counters reset");
+        // Wake screen on any touch
+        if (!screenOn) {
+            wakeScreen();
+            touchStart = 0;
+            longPressHandled = true;  // Don't process this touch further
+        } else {
+            if (touchStart == 0) {
+                touchStart = now;
+                longPressHandled = false;
+                lastActivityTime = now;  // Reset activity timer
+            } else if (!longPressHandled && (now - touchStart > 800)) {
+                // Long press
+                if (t.y < 40) {
+                    // Header zone: check if tap on SD icon area (110-128)
+                    if (t.x >= 110 && t.x <= 128) {
+                        // Long press on SD icon: toggle SD logging
+                        toggleSDLogging();
+                    } else {
+                        // Other header area: cycle brightness
+                        cycleBrightness();
+                    }
+                } else if (t.x < 160) {
+                    // Left zone: previous frame
+                    prevFrame();
+                } else {
+                    // Right zone: reset counters
+                    txCount = 0;
+                    rxCount = 0;
+                    memset(rxLog, 0, sizeof(rxLog));
+                    rxLogIndex = 0;
+                    if (debugSerial) Serial.println("[TOUCH] Counters reset");
+                }
+                longPressHandled = true;
             }
-            longPressHandled = true;
         }
     } else {
-        // Reset when released
-        static unsigned long touchStart = 0;
+        // Touch released
+        if (touchStart > 0 && !longPressHandled) {
+            // Short tap - check for double tap on header
+            auto t = M5.Touch.getPressPoint();
+            if (t.y < 40) {
+                // Tap on header area - check for double tap
+                if (doubleTapPending && (now - lastTapTime < 400)) {
+                    // Double tap: toggle screen on/off
+                    if (screenOn && currentBrightness > BRIGHTNESS_MIN) {
+                        setScreenBrightness(0);
+                        powerSaveMode = true;
+                    } else {
+                        wakeScreen();
+                    }
+                    doubleTapPending = false;
+                } else {
+                    doubleTapPending = true;
+                    lastTapTime = now;
+                }
+            }
+        }
         touchStart = 0;
     }
     
+    // Clear double tap pending if timeout
+    if (doubleTapPending && (now - lastTapTime > 400)) {
+        doubleTapPending = false;
+    }
+    
+    // Update power saving state
+    updatePowerSaving();
+    
     // Update display every 100ms (only modified zones are redrawn)
-    if (now - lastDisplayUpdate >= 100) {
+    if (screenOn && (now - lastDisplayUpdate >= 100)) {
         lastDisplayUpdate = now;
         updateDisplay(true);
     }
