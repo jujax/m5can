@@ -17,36 +17,12 @@
 #define CAN_SPEED    CAN_500KBPS
 #define CAN_CLOCK    MCP_8MHZ
 
-// ===== OBD-II / Automotive Frames =====
-struct CarFrame {
-    unsigned long id;
-    uint8_t len;
-    uint8_t data[8];
-    const char* name;
-};
-
-// Standard OBD-II frames (ID 0x7DF = broadcast, responses on 0x7E8-0x7EF)
-const CarFrame carFrames[] = {
-    // OBD-II Mode 01 requests (real-time data)
-    {0x7DF, 8, {0x02, 0x01, 0x0C, 0x55, 0x55, 0x55, 0x55, 0x55}, "RPM"},           // Engine RPM
-    {0x7DF, 8, {0x02, 0x01, 0x0D, 0x55, 0x55, 0x55, 0x55, 0x55}, "Speed"},         // Vehicle speed
-    {0x7DF, 8, {0x02, 0x01, 0x05, 0x55, 0x55, 0x55, 0x55, 0x55}, "Coolant"},       // Coolant temperature
-    {0x7DF, 8, {0x02, 0x01, 0x0F, 0x55, 0x55, 0x55, 0x55, 0x55}, "Intake"},        // Intake air temperature
-    {0x7DF, 8, {0x02, 0x01, 0x11, 0x55, 0x55, 0x55, 0x55, 0x55}, "Throttle"},      // Throttle position
-    {0x7DF, 8, {0x02, 0x01, 0x2F, 0x55, 0x55, 0x55, 0x55, 0x55}, "Fuel"},          // Fuel level
-    {0x7DF, 8, {0x02, 0x01, 0x04, 0x55, 0x55, 0x55, 0x55, 0x55}, "Load"},          // Engine load
-    {0x7DF, 8, {0x02, 0x01, 0x42, 0x55, 0x55, 0x55, 0x55, 0x55}, "Voltage"},       // Battery voltage
-    
-    // Mode 09 request (vehicle info)
-    {0x7DF, 8, {0x02, 0x09, 0x02, 0x55, 0x55, 0x55, 0x55, 0x55}, "VIN"},           // VIN number
-    
-    // Common CAN frames (non-OBD)
-    {0x316, 8, {0x05, 0x1C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "RPM BMW"},       // BMW E46 RPM
-    {0x153, 8, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "Speed VAG"},     // VAG speed
-    {0x280, 8, {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, "RPM PSA"},       // PSA RPM
-};
-const int numCarFrames = sizeof(carFrames) / sizeof(carFrames[0]);
-int currentFrameIndex = 0;
+// ===== CAN Frame Configuration =====
+// Single frame: Vehicle Speed (OBD-II Mode 01, PID 0x0D)
+const unsigned long CAN_FRAME_ID = 0x7DF;
+const uint8_t CAN_FRAME_DATA[8] = {0x02, 0x01, 0x0D, 0x55, 0x55, 0x55, 0x55, 0x55};
+const uint8_t CAN_FRAME_LEN = 8;
+const char* CAN_FRAME_NAME = "Speed";
 
 // ===== Global Variables =====
 MCP_CAN CAN(CAN_CS_PIN);
@@ -56,20 +32,15 @@ unsigned long txCount = 0;
 unsigned long rxCount = 0;
 unsigned long lastTxTime = 0;
 unsigned long lastDisplayUpdate = 0;
-bool debugSerial = true;
 bool sendingEnabled = false;  // Paused at startup
 bool lastSendingState = true; // To detect state change
 
-// ===== Power Management & Screen Dimming =====
-#define BRIGHTNESS_MAX       100    // Maximum brightness (0-100 maps to LCD voltage)
-#define BRIGHTNESS_DIM       30     // Dimmed brightness
-#define BRIGHTNESS_MIN       10     // Minimum before off
-#define TIMEOUT_DIM_MS       15000  // 15s before dimming
-#define TIMEOUT_OFF_MS       60000  // 60s before screen off
+// ===== Power Management =====
+#define BRIGHTNESS_DEFAULT   100    // Default brightness (0-100)
+#define TIMEOUT_OFF_MS       15000  // 15s before screen off
 #define CHARGE_CURRENT_FAST  0x0F   // ~780mA charge current (max safe)
 
-uint8_t currentBrightness = BRIGHTNESS_MAX;
-uint8_t targetBrightness = BRIGHTNESS_MAX;
+uint8_t currentBrightness = BRIGHTNESS_DEFAULT;
 bool screenOn = true;
 unsigned long lastActivityTime = 0;
 bool powerSaveMode = false;
@@ -82,7 +53,25 @@ File logFile;
 unsigned long logFileSize = 0;
 #define MAX_LOG_FILE_SIZE  10485760  // 10MB max file size
 #define LOG_FILENAME_PREFIX "/can_log_"
-#define LOG_FILENAME_EXT   ".txt"
+#define LOG_FILENAME_EXT   ".csv"
+
+// ===== IMU Logging =====
+File imuLogFile;
+unsigned long imuLogFileSize = 0;
+unsigned long lastImuLogTime = 0;
+#define IMU_LOG_INTERVAL_MS  100  // 10 Hz
+#define IMU_FILENAME_PREFIX "/imu_log_"
+
+// ===== Session ID (shared between CAN and IMU logs) =====
+String currentSessionId = "";
+
+// Generate a unique random session ID (6 hex characters)
+String generateSessionId() {
+    uint32_t randNum = esp_random();  // Hardware RNG on ESP32
+    char idStr[7];
+    snprintf(idStr, sizeof(idStr), "%06X", (unsigned int)(randNum & 0xFFFFFF));
+    return String(idStr);
+}
 
 // Buffer for received messages (log of last 5)
 struct CanMessage {
@@ -135,30 +124,19 @@ int getBatteryPercent() {
 
 // ===== Power Management Functions =====
 
-// Set LCD brightness (0-100%)
-void setScreenBrightness(uint8_t percent) {
-    if (percent > 100) percent = 100;
-    currentBrightness = percent;
-    
-    if (percent == 0) {
-        // Turn off LCD backlight completely
+// Turn screen on or off
+void setScreenOn(bool on) {
+    if (on) {
+        M5.Axp.SetDCDC3(true);  // LCD power on
+        M5.Axp.SetLcdVoltage(2800);  // Normal brightness
+        screenOn = true;
+        currentBrightness = BRIGHTNESS_DEFAULT;
+        Serial.println("[PWR] Screen ON");
+    } else {
         M5.Axp.SetDCDC3(false);  // LCD power off
         screenOn = false;
-    } else {
-        if (!screenOn) {
-            M5.Axp.SetDCDC3(true);  // LCD power on
-            screenOn = true;
-        }
-        // Map 1-100% to LCD voltage range (2500-3300mV)
-        // Lower voltage = dimmer, but too low can cause issues
-        // Using brightness via PWM is better - M5Core2 uses 2800mV typical
-        uint16_t voltage = 2500 + (percent * 5);  // 2505-3000mV range
-        if (voltage > 3000) voltage = 3000;
-        M5.Axp.SetLcdVoltage(voltage);
-    }
-    
-    if (debugSerial) {
-        Serial.printf("[PWR] Brightness: %d%%\n", percent);
+        currentBrightness = 0;
+        Serial.println("[PWR] Screen OFF");
     }
 }
 
@@ -166,13 +144,10 @@ void setScreenBrightness(uint8_t percent) {
 void wakeScreen() {
     lastActivityTime = millis();
     
-    if (!screenOn || currentBrightness < targetBrightness) {
-        setScreenBrightness(targetBrightness);
+    if (!screenOn) {
+        setScreenOn(true);
         powerSaveMode = false;
         displayInitialized = false;  // Force redraw after wake
-        if (debugSerial) {
-            Serial.println("[PWR] Screen wake up");
-        }
     }
 }
 
@@ -192,9 +167,7 @@ void setupFastCharging() {
     Wire.write(0xC8);  // 0xC8 = enable (bit 7) + 780mA (0x08)
     Wire.endTransmission();
     
-    if (debugSerial) {
-        Serial.println("[PWR] Fast charging enabled (780mA)");
-    }
+    Serial.println("[PWR] Fast charging enabled (780mA)");
 }
 
 // Reduce power consumption
@@ -208,9 +181,7 @@ void setupPowerSaving() {
     // Set CPU frequency lower when idle (optional - can affect CAN timing)
     // setCpuFrequencyMhz(80);  // Reduce from 240MHz to 80MHz
     
-    if (debugSerial) {
-        Serial.println("[PWR] Power saving configured");
-    }
+    Serial.println("[PWR] Power saving configured");
 }
 
 // Check and update power saving state
@@ -218,40 +189,24 @@ void updatePowerSaving() {
     unsigned long now = millis();
     unsigned long idleTime = now - lastActivityTime;
     
-    if (screenOn) {
-        if (idleTime > TIMEOUT_OFF_MS && !powerSaveMode) {
-            // Screen OFF after long inactivity
-            setScreenBrightness(0);
-            powerSaveMode = true;
-            if (debugSerial) {
-                Serial.println("[PWR] Screen OFF (timeout)");
-            }
-        } else if (idleTime > TIMEOUT_DIM_MS && currentBrightness > BRIGHTNESS_DIM) {
-            // Dim screen after short inactivity
-            setScreenBrightness(BRIGHTNESS_DIM);
-            if (debugSerial) {
-                Serial.println("[PWR] Screen dimmed");
-            }
-        }
+    if (screenOn && idleTime > TIMEOUT_OFF_MS && !powerSaveMode) {
+        // Screen OFF after inactivity
+        setScreenOn(false);
+        powerSaveMode = true;
     }
 }
 
-// Cycle through brightness levels manually
-void cycleBrightness() {
+// Toggle screen on/off
+void toggleScreen() {
     lastActivityTime = millis();
     
-    if (targetBrightness == BRIGHTNESS_MAX) {
-        targetBrightness = BRIGHTNESS_DIM;
-    } else if (targetBrightness == BRIGHTNESS_DIM) {
-        targetBrightness = BRIGHTNESS_MIN;
+    if (screenOn) {
+        setScreenOn(false);
+        powerSaveMode = true;
     } else {
-        targetBrightness = BRIGHTNESS_MAX;
-    }
-    
-    setScreenBrightness(targetBrightness);
-    
-    if (debugSerial) {
-        Serial.printf("[PWR] Brightness set to %d%%\n", targetBrightness);
+        setScreenOn(true);
+        powerSaveMode = false;
+        displayInitialized = false;  // Force redraw
     }
 }
 
@@ -262,48 +217,33 @@ bool initSD() {
     if (sdInitialized) return true;
     
     if (!SD.begin()) {
-        if (debugSerial) {
-            Serial.println("[SD] Failed to initialize SD card");
-        }
+        Serial.println("[SD] Failed to initialize SD card");
         return false;
     }
     
     uint8_t cardType = SD.cardType();
     if (cardType == CARD_NONE) {
-        if (debugSerial) {
-            Serial.println("[SD] No SD card found");
-        }
+        Serial.println("[SD] No SD card found");
         return false;
     }
     
     sdInitialized = true;
     
-    if (debugSerial) {
-        Serial.print("[SD] Card type: ");
-        switch (cardType) {
-            case CARD_MMC: Serial.println("MMC"); break;
-            case CARD_SD: Serial.println("SDSC"); break;
-            case CARD_SDHC: Serial.println("SDHC"); break;
-            default: Serial.println("Unknown"); break;
-        }
-        Serial.printf("[SD] Card size: %.2f GB\n", (float)SD.cardSize() / (1024 * 1024 * 1024));
+    Serial.print("[SD] Card type: ");
+    switch (cardType) {
+        case CARD_MMC: Serial.println("MMC"); break;
+        case CARD_SD: Serial.println("SDSC"); break;
+        case CARD_SDHC: Serial.println("SDHC"); break;
+        default: Serial.println("Unknown"); break;
     }
+    Serial.printf("[SD] Card size: %.2f GB\n", (float)SD.cardSize() / (1024 * 1024 * 1024));
     
     return true;
 }
 
-// Create a new log file with timestamp
+// Create a new CAN log filename using session ID
 String createLogFilename() {
-    // Find next available filename
-    int fileNum = 0;
-    String filename;
-    
-    do {
-        filename = String(LOG_FILENAME_PREFIX) + String(fileNum) + String(LOG_FILENAME_EXT);
-        fileNum++;
-    } while (SD.exists(filename) && fileNum < 1000);
-    
-    return filename;
+    return String(LOG_FILENAME_PREFIX) + currentSessionId + String(LOG_FILENAME_EXT);
 }
 
 // Open log file for writing
@@ -323,23 +263,16 @@ bool openLogFile() {
     logFile = SD.open(filename, FILE_WRITE);
     
     if (!logFile) {
-        if (debugSerial) {
-            Serial.printf("[SD] Failed to open file: %s\n", filename.c_str());
-        }
+        Serial.printf("[SD] Failed to open file: %s\n", filename.c_str());
         return false;
     }
     
     logFileSize = 0;
     
-    // Write header
-    logFile.println("=== M5Stack CAN Bus Logger ===");
-    logFile.printf("Started: %lu ms\n", millis());
-    logFile.println("Format: timestamp_ms,type,id,length,data_hex");
-    logFile.println("---");
+    // Write CSV header
+    logFile.println("timestamp_ms,type,id,length,data_hex");
     
-    if (debugSerial) {
-        Serial.printf("[SD] Logging to: %s\n", filename.c_str());
-    }
+    Serial.printf("[SD] Logging to: %s\n", filename.c_str());
     
     return true;
 }
@@ -348,10 +281,32 @@ bool openLogFile() {
 void closeLogFile() {
     if (logFile) {
         logFile.close();
-        if (debugSerial) {
-            Serial.println("[SD] Log file closed");
-        }
+        Serial.println("[SD] Log file closed");
     }
+}
+
+// Forward declarations for rotation
+void closeImuLogFile();
+bool openImuLogFile();
+
+// Rotate all log files (CAN + IMU) with new session ID
+bool rotateLogFiles() {
+    closeLogFile();
+    closeImuLogFile();
+    
+    currentSessionId = generateSessionId();
+    Serial.printf("[SD] Rotating logs, new session ID: %s\n", currentSessionId.c_str());
+    
+    bool canOk = openLogFile();
+    bool imuOk = openImuLogFile();
+    
+    if (!canOk || !imuOk) {
+        if (canOk) closeLogFile();
+        if (imuOk) closeImuLogFile();
+        return false;
+    }
+    
+    return true;
 }
 
 // Log a CAN frame to SD card
@@ -360,14 +315,11 @@ void logCanFrame(const char* type, unsigned long id, uint8_t len, uint8_t* data)
         return;
     }
     
-    // Check file size limit
-    if (logFileSize > MAX_LOG_FILE_SIZE) {
-        closeLogFile();
-        if (!openLogFile()) {
+    // Check file size limit - rotate both files together
+    if (logFileSize > MAX_LOG_FILE_SIZE || imuLogFileSize > MAX_LOG_FILE_SIZE) {
+        if (!rotateLogFiles()) {
             sdLoggingEnabled = false;
-            if (debugSerial) {
-                Serial.println("[SD] Failed to create new log file, logging disabled");
-            }
+            Serial.println("[SD] Failed to rotate log files, logging disabled");
             return;
         }
     }
@@ -394,27 +346,109 @@ void logCanFrame(const char* type, unsigned long id, uint8_t len, uint8_t* data)
     }
 }
 
-// Toggle SD logging
+// ===== IMU Log File Functions =====
+
+// Create a new IMU log filename using session ID
+String createImuLogFilename() {
+    return String(IMU_FILENAME_PREFIX) + currentSessionId + String(LOG_FILENAME_EXT);
+}
+
+// Open IMU log file for writing
+bool openImuLogFile() {
+    if (!sdInitialized) {
+        if (!initSD()) {
+            return false;
+        }
+    }
+    
+    // Close existing file if open
+    if (imuLogFile) {
+        imuLogFile.close();
+    }
+    
+    String filename = createImuLogFilename();
+    imuLogFile = SD.open(filename, FILE_WRITE);
+    
+    if (!imuLogFile) {
+        Serial.printf("[SD] Failed to open IMU file: %s\n", filename.c_str());
+        return false;
+    }
+    
+    imuLogFileSize = 0;
+    
+    // Write CSV header
+    imuLogFile.println("timestamp_ms,accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z");
+    
+    Serial.printf("[SD] IMU logging to: %s\n", filename.c_str());
+    
+    return true;
+}
+
+// Close IMU log file
+void closeImuLogFile() {
+    if (imuLogFile) {
+        imuLogFile.close();
+        Serial.println("[SD] IMU log file closed");
+    }
+}
+
+// Log IMU data to SD card
+void logImuData(float accX, float accY, float accZ, float gyroX, float gyroY, float gyroZ) {
+    if (!sdLoggingEnabled || !imuLogFile) {
+        return;
+    }
+    
+    // Check file size limit - rotate both files together
+    if (logFileSize > MAX_LOG_FILE_SIZE || imuLogFileSize > MAX_LOG_FILE_SIZE) {
+        if (!rotateLogFiles()) {
+            sdLoggingEnabled = false;
+            Serial.println("[SD] Failed to rotate log files, logging disabled");
+            return;
+        }
+    }
+    
+    // Format: timestamp_ms,accel_x,accel_y,accel_z,gyro_x,gyro_y,gyro_z
+    unsigned long timestamp = millis();
+    imuLogFile.printf("%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n", 
+                      timestamp, accX, accY, accZ, gyroX, gyroY, gyroZ);
+    
+    imuLogFileSize = imuLogFile.size();
+    
+    // Flush periodically to prevent data loss (sync with CAN log flush)
+    static unsigned long lastImuFlush = 0;
+    if (millis() - lastImuFlush > 5000) {  // Every 5 seconds
+        imuLogFile.flush();
+        lastImuFlush = millis();
+    }
+}
+
+// Toggle SD logging (CAN + IMU)
 void toggleSDLogging() {
     if (!sdLoggingEnabled) {
-        // Enable logging
-        if (openLogFile()) {
+        // Generate unique session ID for both files
+        currentSessionId = generateSessionId();
+        Serial.printf("[SD] New session ID: %s\n", currentSessionId.c_str());
+        
+        // Enable logging - open both CAN and IMU files
+        bool canOk = openLogFile();
+        bool imuOk = openImuLogFile();
+        
+        if (canOk && imuOk) {
             sdLoggingEnabled = true;
-            if (debugSerial) {
-                Serial.println("[SD] Logging enabled");
-            }
+            lastImuLogTime = millis();  // Reset IMU timing
+            Serial.println("[SD] Logging enabled (CAN + IMU)");
         } else {
-            if (debugSerial) {
-                Serial.println("[SD] Failed to enable logging");
-            }
+            // Close any opened file on partial failure
+            if (canOk) closeLogFile();
+            if (imuOk) closeImuLogFile();
+            Serial.println("[SD] Failed to enable logging");
         }
     } else {
-        // Disable logging
+        // Disable logging - close both files
         closeLogFile();
+        closeImuLogFile();
         sdLoggingEnabled = false;
-        if (debugSerial) {
-            Serial.println("[SD] Logging disabled");
-        }
+        Serial.println("[SD] Logging disabled");
     }
 }
 
@@ -423,8 +457,8 @@ int lastBatPercent = -1;
 bool lastCharging = false;
 unsigned long lastTxCount = 0;
 unsigned long lastRxCount = 0;
-unsigned long lastRxLogIndex = 0;
-bool lastDebugState = true;
+bool buttonsDrawn = false;  // Track if buttons have been drawn
+bool lastSDLoggingState = false;  // Track SD logging state for button update
 
 // ===== Display Functions =====
 
@@ -486,32 +520,6 @@ void drawStaticElements() {
     M5.Lcd.print("RX");
 }
 
-void drawBrightnessIcon(int x, int y, uint8_t brightness) {
-    // Sun icon with rays based on brightness
-    uint16_t color = (brightness >= BRIGHTNESS_MAX) ? COLOR_CHARGING : 
-                     (brightness >= BRIGHTNESS_DIM) ? COLOR_DIM : COLOR_ERROR;
-    
-    // Clear area
-    M5.Lcd.fillRect(x, y, 20, 12, COLOR_HEADER);
-    
-    // Sun circle
-    M5.Lcd.fillCircle(x + 6, y + 6, 3, color);
-    
-    // Rays (more rays = brighter)
-    if (brightness >= BRIGHTNESS_DIM) {
-        M5.Lcd.drawLine(x + 6, y, x + 6, y + 2, color);      // Top
-        M5.Lcd.drawLine(x + 6, y + 10, x + 6, y + 12, color); // Bottom
-        M5.Lcd.drawLine(x, y + 6, x + 2, y + 6, color);      // Left
-        M5.Lcd.drawLine(x + 10, y + 6, x + 12, y + 6, color); // Right
-    }
-    if (brightness >= BRIGHTNESS_MAX) {
-        M5.Lcd.drawLine(x + 2, y + 2, x + 4, y + 4, color);   // TL
-        M5.Lcd.drawLine(x + 8, y + 4, x + 10, y + 2, color);  // TR
-        M5.Lcd.drawLine(x + 2, y + 10, x + 4, y + 8, color);  // BL
-        M5.Lcd.drawLine(x + 8, y + 8, x + 10, y + 10, color); // BR
-    }
-}
-
 void drawSDIcon(int x, int y, bool enabled, bool initialized) {
     // SD card icon
     uint16_t color = initialized ? (enabled ? COLOR_OK : COLOR_DIM) : COLOR_ERROR;
@@ -534,13 +542,6 @@ void updateHeader(bool canOk) {
     int ledColor = canOk ? COLOR_OK : COLOR_ERROR;
     M5.Lcd.fillCircle(18, 18, 8, ledColor);
     M5.Lcd.drawCircle(18, 18, 8, COLOR_TEXT);
-    
-    // Brightness icon (after CAN label)
-    static uint8_t lastBrightness = 255;
-    if (currentBrightness != lastBrightness) {
-        lastBrightness = currentBrightness;
-        drawBrightnessIcon(70, 12, currentBrightness);
-    }
     
     // SD card icon
     static bool lastSDState = false;
@@ -585,45 +586,41 @@ void updateHeader(bool canOk) {
 }
 
 void updateTxSection() {
-    static int lastFrameIndex = -1;
-    bool needUpdate = (txCount != lastTxCount) || (currentFrameIndex != lastFrameIndex);
+    bool needUpdate = (txCount != lastTxCount);
     
     if (needUpdate) {
         lastTxCount = txCount;
-        lastFrameIndex = currentFrameIndex;
-        
-        const CarFrame& frame = carFrames[currentFrameIndex];
         
         // Clear data area
         M5.Lcd.fillRect(15, 50, 295, 40, COLOR_BG);
         
-        // Frame name + state
+        // State indicator
         M5.Lcd.setTextColor(sendingEnabled ? COLOR_OK : COLOR_DIM);
         M5.Lcd.setTextSize(1);
         M5.Lcd.setCursor(45, 41);
-        M5.Lcd.printf("%s %d/%d", sendingEnabled ? ">" : "||", currentFrameIndex + 1, numCarFrames);
+        M5.Lcd.print(sendingEnabled ? ">" : "||");
         
         // Frame name
         M5.Lcd.setTextColor(COLOR_TEXT);
         M5.Lcd.setTextSize(2);
         M5.Lcd.setCursor(15, 52);
-        M5.Lcd.print(frame.name);
+        M5.Lcd.print(CAN_FRAME_NAME);
         
         // ID
         M5.Lcd.setTextColor(COLOR_TX);
-        M5.Lcd.setCursor(150, 52);
-        M5.Lcd.printf("0x%03lX", frame.id);
+        M5.Lcd.setCursor(120, 52);
+        M5.Lcd.printf("0x%03lX", CAN_FRAME_ID);
         
         // Data
         M5.Lcd.setTextColor(COLOR_TEXT);
         M5.Lcd.setTextSize(1);
         M5.Lcd.setCursor(15, 75);
-        M5.Lcd.print(formatHex((uint8_t*)frame.data, frame.len));
+        M5.Lcd.print(formatHex((uint8_t*)CAN_FRAME_DATA, CAN_FRAME_LEN));
         
         // TX counter
         M5.Lcd.setTextColor(COLOR_DIM);
         M5.Lcd.setTextSize(2);
-        M5.Lcd.setCursor(260, 52);
+        M5.Lcd.setCursor(220, 52);
         M5.Lcd.printf("#%lu", txCount);
     }
 }
@@ -676,9 +673,8 @@ void updateRxLog() {
 }
 
 void updateButtons() {
-    static bool buttonsDrawn = false;
     bool sendChanged = (sendingEnabled != lastSendingState);
-    bool debugChanged = (debugSerial != lastDebugState);
+    bool sdChanged = (sdLoggingEnabled != lastSDLoggingState);
     
     int btnY = 205;
     int btnH = 30;
@@ -689,7 +685,7 @@ void updateButtons() {
     if (!buttonsDrawn || sendChanged) {
         lastSendingState = sendingEnabled;
         
-        // PLAY/PAUSE button
+        // PLAY/PAUSE button (A)
         uint16_t playColor = sendingEnabled ? COLOR_OK : COLOR_ERROR;
         drawRoundRect(spacing, btnY, btnW, btnH, 5, playColor, sendingEnabled ? 0x0320 : 0x4000);
         M5.Lcd.setTextColor(playColor);
@@ -698,25 +694,25 @@ void updateButtons() {
         M5.Lcd.print(sendingEnabled ? "PAUSE" : " PLAY");
     }
     
-    // NEXT button (static after first draw)
+    // SCREEN button (B) - static after first draw
     if (!buttonsDrawn) {
         drawRoundRect(btnW + spacing * 2, btnY, btnW, btnH, 5, COLOR_CHARGING, 0x4200);
         M5.Lcd.setTextColor(COLOR_CHARGING);
         M5.Lcd.setTextSize(2);
-        M5.Lcd.setCursor(btnW + spacing * 2 + 20, btnY + 8);
-        M5.Lcd.print("NEXT");
+        M5.Lcd.setCursor(btnW + spacing * 2 + 8, btnY + 8);
+        M5.Lcd.print("SCREEN");
     }
     
-    // DEBUG button
-    if (!buttonsDrawn || debugChanged) {
-        lastDebugState = debugSerial;
+    // SD REC button (C)
+    if (!buttonsDrawn || sdChanged) {
+        lastSDLoggingState = sdLoggingEnabled;
         
-        uint16_t dbgColor = debugSerial ? COLOR_OK : COLOR_DIM;
-        drawRoundRect(btnW * 2 + spacing * 3, btnY, btnW, btnH, 5, dbgColor, debugSerial ? 0x0320 : 0x2104);
-        M5.Lcd.setTextColor(dbgColor);
+        uint16_t sdColor = sdLoggingEnabled ? COLOR_OK : COLOR_DIM;
+        drawRoundRect(btnW * 2 + spacing * 3, btnY, btnW, btnH, 5, sdColor, sdLoggingEnabled ? 0x0320 : 0x2104);
+        M5.Lcd.setTextColor(sdColor);
         M5.Lcd.setTextSize(2);
-        M5.Lcd.setCursor(btnW * 2 + spacing * 3 + 12, btnY + 8);
-        M5.Lcd.print("DEBUG");
+        M5.Lcd.setCursor(btnW * 2 + spacing * 3 + 8, btnY + 8);
+        M5.Lcd.print("SD REC");
     }
     
     buttonsDrawn = true;
@@ -732,8 +728,9 @@ void updateDisplay(bool canOk) {
         lastBatPercent = -1;
         lastTxCount = 0;
         lastRxCount = 0;
-        lastDebugState = !debugSerial;
         lastSendingState = !sendingEnabled;
+        lastSDLoggingState = !sdLoggingEnabled;
+        buttonsDrawn = false;  // Force buttons redraw
     }
     
     // Partial updates only
@@ -745,41 +742,21 @@ void updateDisplay(bool canOk) {
 
 // ===== CAN Transmission =====
 void sendCanMessage() {
-    const CarFrame& frame = carFrames[currentFrameIndex];
-    
-    byte result = CAN.sendMsgBuf(frame.id, 0, frame.len, (uint8_t*)frame.data);
+    byte result = CAN.sendMsgBuf(CAN_FRAME_ID, 0, CAN_FRAME_LEN, (uint8_t*)CAN_FRAME_DATA);
     
     if (result == CAN_OK) {
         txCount++;
-        lastTx.id = frame.id;
-        lastTx.len = frame.len;
-        memcpy(lastTx.data, frame.data, frame.len);
+        lastTx.id = CAN_FRAME_ID;
+        lastTx.len = CAN_FRAME_LEN;
+        memcpy(lastTx.data, CAN_FRAME_DATA, CAN_FRAME_LEN);
         
         // Log to SD card
-        logCanFrame("TX", frame.id, frame.len, (uint8_t*)frame.data);
+        logCanFrame("TX", CAN_FRAME_ID, CAN_FRAME_LEN, (uint8_t*)CAN_FRAME_DATA);
         
-        if (debugSerial) {
-            Serial.printf("[TX] %s ID: 0x%03lX Data: %s\n", 
-                frame.name, frame.id, formatHex((uint8_t*)frame.data, frame.len).c_str());
-        }
+        Serial.printf("[TX] %s ID: 0x%03lX Data: %s\n", 
+            CAN_FRAME_NAME, CAN_FRAME_ID, formatHex((uint8_t*)CAN_FRAME_DATA, CAN_FRAME_LEN).c_str());
     } else {
-        if (debugSerial) {
-            Serial.println("[TX] CAN send error");
-        }
-    }
-}
-
-void nextFrame() {
-    currentFrameIndex = (currentFrameIndex + 1) % numCarFrames;
-    if (debugSerial) {
-        Serial.printf("[FRAME] %d/%d: %s\n", currentFrameIndex + 1, numCarFrames, carFrames[currentFrameIndex].name);
-    }
-}
-
-void prevFrame() {
-    currentFrameIndex = (currentFrameIndex - 1 + numCarFrames) % numCarFrames;
-    if (debugSerial) {
-        Serial.printf("[FRAME] %d/%d: %s\n", currentFrameIndex + 1, numCarFrames, carFrames[currentFrameIndex].name);
+        Serial.println("[TX] CAN send error");
     }
 }
 
@@ -803,9 +780,7 @@ void receiveCanMessages() {
         // Log to SD card
         logCanFrame("RX", rxId, len, rxBuf);
         
-        if (debugSerial) {
-            Serial.printf("[RX] ID: 0x%03lX Data: %s\n", rxId, formatHex(rxBuf, len).c_str());
-        }
+        Serial.printf("[RX] ID: 0x%03lX Data: %s\n", rxId, formatHex(rxBuf, len).c_str());
     }
     canMsgReceived = false;
 }
@@ -815,6 +790,9 @@ void setup() {
     // Initialize M5Core2 (LCD, SD, Serial, I2C)
     // Note: Speaker (I2S) disabled because GPIO2 is shared with CAN_INT
     M5.begin(true, true, true, true, kMBusModeOutput);  // SD enabled
+    
+    // Initialize IMU (MPU6886)
+    M5.IMU.Init();
     
     M5.Lcd.fillScreen(COLOR_BG);
     M5.Lcd.setTextSize(2);
@@ -911,7 +889,7 @@ void setup() {
     // Configure power management
     setupFastCharging();
     setupPowerSaving();
-    setScreenBrightness(BRIGHTNESS_MAX);
+    setScreenOn(true);
     lastActivityTime = millis();
     
     // Initialize SD card
@@ -960,6 +938,18 @@ void loop() {
         sendCanMessage();
     }
     
+    // IMU logging at 10 Hz (100ms interval)
+    if (sdLoggingEnabled && (now - lastImuLogTime >= IMU_LOG_INTERVAL_MS)) {
+        float accX, accY, accZ;
+        float gyroX, gyroY, gyroZ;
+        
+        M5.IMU.getAccelData(&accX, &accY, &accZ);
+        M5.IMU.getGyroData(&gyroX, &gyroY, &gyroZ);
+        
+        logImuData(accX, accY, accZ, gyroX, gyroY, gyroZ);
+        lastImuLogTime = now;
+    }
+    
     // Button A: Play/Pause automatic sending
     if (M5.BtnA.wasPressed()) {
         wakeScreen();  // Wake screen on activity
@@ -969,139 +959,34 @@ void loop() {
             powerSaveMode = false;
         } else {
             sendingEnabled = !sendingEnabled;
-            if (debugSerial) {
-                Serial.printf("[BTN] Auto send: %s\n", sendingEnabled ? "PLAY" : "PAUSE");
-            }
+            Serial.printf("[BTN] Auto send: %s\n", sendingEnabled ? "PLAY" : "PAUSE");
             if (sendingEnabled) {
                 lastTxTime = now;  // Reset timer for immediate send
             }
         }
     }
     
-    // Button B: Next frame
+    // Button B: Toggle screen on/off
     if (M5.BtnB.wasPressed()) {
+        toggleScreen();
+    }
+    
+    // Button C: Toggle SD logging
+    if (M5.BtnC.wasPressed()) {
         wakeScreen();  // Wake screen on activity
         
         if (!powerSaveMode) {
-            nextFrame();
-            // Send new frame immediately if in play mode
-            if (sendingEnabled) {
-                sendCanMessage();
-                lastTxTime = now;
-            }
+            toggleSDLogging();
         }
     }
     
-    // Button C: Toggle serial debug (short), cycle brightness (1s long), toggle SD logging (2s long)
-    static unsigned long btnCPressStart = 0;
-    static bool brightnessHandled = false;
-    static bool sdLoggingHandled = false;
-    
-    if (M5.BtnC.isPressed()) {
-        if (btnCPressStart == 0) {
-            btnCPressStart = now;
-            brightnessHandled = false;
-            sdLoggingHandled = false;
-        } else {
-            // Long press 1s: cycle brightness
-            if (!brightnessHandled && (now - btnCPressStart > 1000) && (now - btnCPressStart < 2000)) {
-                cycleBrightness();
-                brightnessHandled = true;
-            }
-            // Long press 2s: toggle SD logging
-            if (!sdLoggingHandled && (now - btnCPressStart > 2000)) {
-                toggleSDLogging();
-                sdLoggingHandled = true;
-            }
-        }
-    }
-    if (M5.BtnC.wasReleased()) {
-        wakeScreen();  // Wake screen on activity
-        
-        if (btnCPressStart > 0 && (now - btnCPressStart < 1000)) {
-            // Short press: toggle debug
-            if (!powerSaveMode) {
-                debugSerial = !debugSerial;
-                Serial.printf("[BTN] Serial debug: %s\n", debugSerial ? "ON" : "OFF");
-            }
-        }
-        btnCPressStart = 0;
-        brightnessHandled = false;
-        sdLoggingHandled = false;
-    }
-    
-    // Touch handling
-    static unsigned long touchStart = 0;
-    static bool longPressHandled = false;
-    static bool doubleTapPending = false;
-    static unsigned long lastTapTime = 0;
-    
+    // Touch handling - only wake screen if off
     if (M5.Touch.ispressed()) {
-        auto t = M5.Touch.getPressPoint();
-        
-        // Wake screen on any touch
         if (!screenOn) {
             wakeScreen();
-            touchStart = 0;
-            longPressHandled = true;  // Don't process this touch further
         } else {
-            if (touchStart == 0) {
-                touchStart = now;
-                longPressHandled = false;
-                lastActivityTime = now;  // Reset activity timer
-            } else if (!longPressHandled && (now - touchStart > 800)) {
-                // Long press
-                if (t.y < 40) {
-                    // Header zone: check if tap on SD icon area (110-128)
-                    if (t.x >= 110 && t.x <= 128) {
-                        // Long press on SD icon: toggle SD logging
-                        toggleSDLogging();
-                    } else {
-                        // Other header area: cycle brightness
-                        cycleBrightness();
-                    }
-                } else if (t.x < 160) {
-                    // Left zone: previous frame
-                    prevFrame();
-                } else {
-                    // Right zone: reset counters
-                    txCount = 0;
-                    rxCount = 0;
-                    memset(rxLog, 0, sizeof(rxLog));
-                    rxLogIndex = 0;
-                    if (debugSerial) Serial.println("[TOUCH] Counters reset");
-                }
-                longPressHandled = true;
-            }
+            lastActivityTime = now;  // Reset activity timer on any touch
         }
-    } else {
-        // Touch released
-        if (touchStart > 0 && !longPressHandled) {
-            // Short tap - check for double tap on header
-            auto t = M5.Touch.getPressPoint();
-            if (t.y < 40) {
-                // Tap on header area - check for double tap
-                if (doubleTapPending && (now - lastTapTime < 400)) {
-                    // Double tap: toggle screen on/off
-                    if (screenOn && currentBrightness > BRIGHTNESS_MIN) {
-                        setScreenBrightness(0);
-                        powerSaveMode = true;
-                    } else {
-                        wakeScreen();
-                    }
-                    doubleTapPending = false;
-                } else {
-                    doubleTapPending = true;
-                    lastTapTime = now;
-                }
-            }
-        }
-        touchStart = 0;
-    }
-    
-    // Clear double tap pending if timeout
-    if (doubleTapPending && (now - lastTapTime > 400)) {
-        doubleTapPending = false;
     }
     
     // Update power saving state
